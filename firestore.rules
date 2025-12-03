@@ -1,0 +1,145 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user has access to a project
+    function hasProjectAccess(projectId) {
+      return exists(/databases/$(database)/documents/projectMembers/$(projectId + '_' + request.auth.uid));
+    }
+    
+    // Helper function to check if user has minimum required role
+    function hasMinRole(projectId, minRole) {
+      let memberDoc = get(/databases/$(database)/documents/projectMembers/$(projectId + '_' + request.auth.uid));
+      let role = memberDoc.data.role;
+      let roleValue = role == 'owner' ? 3 : (role == 'editor' ? 2 : (role == 'viewer' ? 1 : 0));
+      let minRoleValue = minRole == 'owner' ? 3 : (minRole == 'editor' ? 2 : (minRole == 'viewer' ? 1 : 0));
+      return roleValue >= minRoleValue;
+    }
+    
+    // Users collection - existing rules
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Projects collection
+    match /projects/{projectId} {
+      // Anyone authenticated can create a project
+      allow create: if isAuthenticated();
+      
+      // Only members can read
+      allow read: if isAuthenticated() && hasProjectAccess(projectId);
+      
+      // Only owners can update or delete
+      allow update, delete: if isAuthenticated() && hasMinRole(projectId, 'owner');
+    }
+    
+    // Project Members collection
+    match /projectMembers/{memberId} {
+      // Allow read if:
+      // 1. It's the user's own membership
+      // 2. User is a member of the same project (to see other members)
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.userId ||
+        exists(/databases/$(database)/documents/projectMembers/$(resource.data.projectId + '_' + request.auth.uid))
+      );
+      
+      // Allow create if:
+      // 1. User is creating their own owner membership (when creating a project)
+      // 2. User is already an owner of the project adding a new member
+      allow create: if isAuthenticated() && (
+        // Creating own owner membership (memberId format: projectId_userId)
+        (request.resource.data.userId == request.auth.uid && request.resource.data.role == 'owner') ||
+        // Existing owner adding new member (check if creator is owner)
+        (exists(/databases/$(database)/documents/projectMembers/$(request.resource.data.projectId + '_' + request.auth.uid)) &&
+         get(/databases/$(database)/documents/projectMembers/$(request.resource.data.projectId + '_' + request.auth.uid)).data.role == 'owner')
+      );
+      
+      // Only owners can update or delete members
+      allow update, delete: if isAuthenticated() && 
+        exists(/databases/$(database)/documents/projectMembers/$(resource.data.projectId + '_' + request.auth.uid)) &&
+        get(/databases/$(database)/documents/projectMembers/$(resource.data.projectId + '_' + request.auth.uid)).data.role == 'owner';
+    }
+    
+    // Collections
+    match /collections/{collectionId} {
+      // Members can read collections
+      allow read: if isAuthenticated() && hasProjectAccess(resource.data.projectId);
+      
+      // Owners and editors can create/update collections
+      allow create: if isAuthenticated() && hasMinRole(request.resource.data.projectId, 'editor');
+      allow update: if isAuthenticated() && hasMinRole(resource.data.projectId, 'editor');
+      
+      // Only owners can delete collections
+      allow delete: if isAuthenticated() && hasMinRole(resource.data.projectId, 'owner');
+    }
+    
+    // Field Definitions
+    match /fieldDefinitions/{fieldId} {
+      // Members can read field definitions if they have access to the collection's project
+      allow read: if isAuthenticated() && (
+        exists(/databases/$(database)/documents/collections/$(resource.data.collectionId)) &&
+        hasProjectAccess(get(/databases/$(database)/documents/collections/$(resource.data.collectionId)).data.projectId)
+      );
+      
+      // Owners and editors can create field definitions
+      // For create, we check the collection exists and user has editor+ access to its project
+      allow create: if isAuthenticated() && (
+        exists(/databases/$(database)/documents/collections/$(request.resource.data.collectionId)) &&
+        hasMinRole(get(/databases/$(database)/documents/collections/$(request.resource.data.collectionId)).data.projectId, 'editor')
+      );
+      
+      // Owners and editors can update field definitions
+      allow update: if isAuthenticated() && (
+        exists(/databases/$(database)/documents/collections/$(resource.data.collectionId)) &&
+        hasMinRole(get(/databases/$(database)/documents/collections/$(resource.data.collectionId)).data.projectId, 'editor')
+      );
+      
+      // Only owners can delete fields
+      allow delete: if isAuthenticated() && (
+        exists(/databases/$(database)/documents/collections/$(resource.data.collectionId)) &&
+        hasMinRole(get(/databases/$(database)/documents/collections/$(resource.data.collectionId)).data.projectId, 'owner')
+      );
+    }
+    
+    // Records (data entries)
+    match /records/{recordId} {
+      // For reading: check if user has access to the record's project
+      allow read: if isAuthenticated() && (
+        // For get operations on specific records
+        hasProjectAccess(resource.data.projectId)
+      );
+      
+      // For list operations: allow if authenticated (will be filtered by where clause)
+      // The where clause on collectionId will limit results
+      allow list: if isAuthenticated();
+      
+      // Editors and owners can create/update records
+      allow create: if isAuthenticated() && hasMinRole(request.resource.data.projectId, 'editor');
+      allow update: if isAuthenticated() && hasMinRole(resource.data.projectId, 'editor');
+      
+      // Editors can delete their own records, owners can delete any
+      allow delete: if isAuthenticated() && (
+        (resource.data.createdBy == request.auth.uid && hasMinRole(resource.data.projectId, 'editor')) ||
+        hasMinRole(resource.data.projectId, 'owner')
+      );
+    }
+    
+    // Analytics collection - existing rules
+    match /analytics/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+    
+    // Activities collection - existing rules
+    match /activities/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+  }
+}
